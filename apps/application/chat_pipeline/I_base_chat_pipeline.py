@@ -13,6 +13,7 @@ import uuid_utils.compat as uuid
 from rest_framework import serializers
 
 from knowledge.models import Paragraph
+from common.handle.dpin_actual_usage import ActualUsageUnavailable
 
 
 class ParagraphPipelineModel:
@@ -155,6 +156,10 @@ class IBaseChatPipelineStep:
             self._run(manage)
             self.context['run_time'] = time.time() - start_time
         except Exception as e:
+            if manage.actual_usage is not None:
+                # 严格失败不持久化异常文本、不投递额外任务，也不使用零用量替代真实数量。
+                manage.actual_usage.fail(None)
+                raise ActualUsageUnavailable() from None
             self.err_message = str(e)
             self.status = 500
             chat_record_id = manage.context.get('chat_record_id') or str(uuid.uuid7())

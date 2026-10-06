@@ -35,6 +35,8 @@ from application.serializers.common import ChatInfo
 from common.database_model_manage.database_model_manage import DatabaseModelManage
 from common.exception.app_exception import AppApiException, AppChatNumOutOfBoundsFailed, ChatException
 from common.handle.base_to_response import BaseToResponse
+from common.handle.dpin_actual_usage import ActualUsageUnavailable
+from application.long_term_memory import request_memory_config
 from common.handle.impl.response.openai_to_response import OpenaiToResponse
 from common.handle.impl.response.system_to_response import SystemToResponse
 from common.utils.common import flat_map, get_file_content, is_valid_uuid
@@ -373,6 +375,13 @@ class ChatSerializers(serializers.Serializer):
                                                      form_data)
         if chat_record_id:
             params['chat_record_id'] = chat_record_id
+        if isinstance(base_to_response, OpenaiToResponse):
+            # 沿用原记忆任务读取实时 Application 的语义，配置复制后仅供本次请求使用。
+            active_application = QuerySet(Application).filter(id=chat_info.application_id).first()
+            try:
+                params['actual_memory_config'] = request_memory_config(active_application, chat_user_id)
+            except ActualUsageUnavailable:
+                return base_to_response.actual_usage_error('MAXKB_ACTUAL_USAGE_UNSUPPORTED')
         chat_info.set_chat(message)
         # 运行流水线作业
         pipeline_message.run(params)
@@ -469,17 +478,14 @@ class ChatSerializers(serializers.Serializer):
         self.is_valid_chat_id(chat_info)
         if not self.data.get('debug'):
             self.is_valid_chat_user()
-        # DPin actual-usage contract v1
-        # These paths can invoke additional models without aggregate upstream usage.
-        # Reject before generation rather than billing only the final model response.
-        if isinstance(base_to_response, OpenaiToResponse) and not instance.get('stream'):
+        # 已归集主回复、问题优化及 ROUND 记忆；其余消费者无完整实际用量证据时拒绝生成。
+        if isinstance(base_to_response, OpenaiToResponse):
             application = chat_info.application
-            active_application = QuerySet(Application).filter(id=chat_info.application_id).only('long_term_enable').first()
             if application.type != ApplicationTypeChoices.SIMPLE or any((
-                application.problem_optimization, application.long_term_enable,
+                instance.get('stream'), chat_info.knowledge_id_list,
                 application.mcp_enable, application.tool_enable, application.application_enable,
-                application.skill_tool_ids, active_application is None,
-                active_application is not None and active_application.long_term_enable,
+                application.skill_tool_ids,
+                application.long_term_enable and application.long_term_trigger_type != 'ROUND',
             )):
                 return base_to_response.actual_usage_error("MAXKB_ACTUAL_USAGE_UNSUPPORTED")
         if chat_info.application.type == ApplicationTypeChoices.SIMPLE:

@@ -24,6 +24,8 @@ def actual_token_usage(message):
             raise ActualUsageUnavailable()
         candidates.append(metadata)
     response = getattr(message, "response_metadata", None)
+    if response is not None and not isinstance(response, dict):
+        raise ActualUsageUnavailable()
     if isinstance(response, dict):
         usage = response.get("token_usage")
         if "token_usage" in response:
@@ -119,6 +121,16 @@ class RequestActualUsage:
     def fail(self, call_id):
         with self._lock:
             self._failed = True
+
+    def invoke(self, purpose, model, messages):
+        call_id = self.begin(purpose)
+        try:
+            result = model.invoke(messages)
+            self.complete(call_id, result)
+            return result
+        except Exception:
+            self.fail(call_id)
+            raise ActualUsageUnavailable() from None
 
     def finalize(self):
         with self._lock:

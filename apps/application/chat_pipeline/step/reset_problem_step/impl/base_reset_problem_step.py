@@ -14,6 +14,7 @@ from langchain_core.messages import HumanMessage
 from application.chat_pipeline.step.reset_problem_step.i_reset_problem_step import IResetProblemStep
 from application.models import ChatRecord
 from common.utils.split_model import flat_map
+from common.handle.dpin_actual_usage import actual_token_usage
 from models_provider.tools import get_model_instance_by_model_workspace_id
 
 prompt = _(
@@ -24,6 +25,7 @@ class BaseResetProblemStep(IResetProblemStep):
     def execute(self, problem_text: str, history_chat_record: List[ChatRecord] = None, model_id: str = None,
                 problem_optimization_prompt=None,
                 workspace_id=None,
+                manage=None,
                 **kwargs) -> str:
         chat_model = get_model_instance_by_model_workspace_id(model_id, workspace_id) if model_id is not None else None
         if chat_model is None:
@@ -35,7 +37,9 @@ class BaseResetProblemStep(IResetProblemStep):
         reset_prompt = problem_optimization_prompt if problem_optimization_prompt else prompt
         message_list = [*flat_map(history_message),
                         HumanMessage(content=reset_prompt.replace('{question}', problem_text))]
-        response = chat_model.invoke(message_list)
+        usage = manage.actual_usage if manage is not None else None
+        response = (usage.invoke('problem_optimization', chat_model, message_list)
+                    if usage else chat_model.invoke(message_list))
         padding_problem = problem_text
         if response.content.__contains__("<data>") and response.content.__contains__('</data>'):
             padding_problem_data = response.content[
@@ -45,12 +49,15 @@ class BaseResetProblemStep(IResetProblemStep):
         elif len(response.content) > 0:
             padding_problem = response.content
 
-        try:
-            request_token = chat_model.get_num_tokens_from_messages(message_list)
-            response_token = chat_model.get_num_tokens(padding_problem)
-        except Exception as e:
-            request_token = 0
-            response_token = 0
+        if usage is not None:
+            request_token, response_token = actual_token_usage(response)
+        else:
+            try:
+                request_token = chat_model.get_num_tokens_from_messages(message_list)
+                response_token = chat_model.get_num_tokens(padding_problem)
+            except Exception as e:
+                request_token = 0
+                response_token = 0
         self.context['message_tokens'] = request_token
         self.context['answer_tokens'] = response_token
         return padding_problem

@@ -35,7 +35,7 @@ class IResetProblemStep(IBaseChatPipelineStep):
         return self.InstanceSerializer
 
     def _run(self, manage: PipelineManage):
-        padding_problem = self.execute(**self.context.get('step_args'))
+        padding_problem = self.execute(**self.context.get('step_args'), manage=manage)
         # 用户输入问题
         source_problem_text = self.context.get('step_args').get('problem_text')
         self.context['problem_text'] = source_problem_text

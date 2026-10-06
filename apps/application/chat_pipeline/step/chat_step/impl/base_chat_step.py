@@ -20,7 +20,7 @@ from application.chat_pipeline.I_base_chat_pipeline import ParagraphPipelineMode
 from application.chat_pipeline.pipeline_manage import PipelineManage
 from application.chat_pipeline.step.chat_step.i_chat_step import IChatStep, PostResponseHandler
 from application.flow.tools import Reasoning, get_tools, mcp_response_generator
-from application.long_term_memory import extract_long_term_memory
+from application.long_term_memory import extract_long_term_memory, extract_long_term_memory_for_request
 from application.models import (
     Application,
     ApplicationAccessToken,
@@ -253,6 +253,8 @@ class BaseChatStep(IChatStep):
         mcp_output_enable=True,
         **kwargs,
     ):
+        if isinstance(manage.get_base_to_response(), OpenaiToResponse) and stream:
+            return manage.get_base_to_response().actual_usage_error("MAXKB_ACTUAL_USAGE_UNSUPPORTED")
         chat_model = (
             get_model_instance_by_model_workspace_id(model_id, workspace_id, **(model_params_setting or {}))
             if model_id is not None
@@ -307,14 +309,15 @@ class BaseChatStep(IChatStep):
 
     def get_details(self, manage, **kwargs):
         # 提取长期记忆
-        extract_long_term_memory.apply_async(
-            args=(
-                manage.context.get("workspace_id"),
-                manage.context.get("application_id"),
-                manage.context.get("chat_user_id"),
-            ),
-            countdown=1,
-        )
+        if manage.actual_usage is None:
+            extract_long_term_memory.apply_async(
+                args=(
+                    manage.context.get("workspace_id"),
+                    manage.context.get("application_id"),
+                    manage.context.get("chat_user_id"),
+                ),
+                countdown=1,
+            )
         return {
             "status": self.status,
             "err_message": self.err_message,
@@ -326,6 +329,7 @@ class BaseChatStep(IChatStep):
             ),
             "message_tokens": self.context.get("message_tokens"),
             "answer_tokens": self.context.get("answer_tokens"),
+            **({'actual_usage_calls': manage.context['actual_usage_calls']} if manage.actual_usage is not None else {}),
             "cost": 0,
         }
 
@@ -649,6 +653,7 @@ class BaseChatStep(IChatStep):
         chat_id=None,
         chat_user_id=None,
         chat_user_type=None,
+        actual_usage=None,
     ):
         if paragraph_list is None:
             paragraph_list = []
@@ -696,7 +701,9 @@ class BaseChatStep(IChatStep):
             )
             if mcp_result:
                 return mcp_result, True
-            return chat_model.invoke(message_list), True
+            result = (actual_usage.invoke('reply', chat_model, message_list)
+                      if actual_usage else chat_model.invoke(message_list))
+            return result, True
 
     def execute_block(
         self,
@@ -732,6 +739,16 @@ class BaseChatStep(IChatStep):
                 (mcp_tool_ids, mcp_servers, tool_ids, application_ids, skill_tool_ids)
             ):
                 raise ActualUsageUnavailable()
+            usage = manage.actual_usage
+            if usage is not None and manage.context.get('actual_memory_config') is not None:
+                memory_row = QuerySet(ApplicationLongTermMemory).filter(
+                    chat_user_id=chat_user_id, application_id=manage.context.get('application_id'),
+                ).first()
+                memory = memory_row.memory if memory_row is not None else ''
+                # 系统消息可能来自会话缓存；使用副本，不能跨请求替换共享消息上的占位符。
+                message_list = [msg.model_copy(update={'content': msg.content.replace('{memory}', memory)})
+                                if isinstance(msg, SystemMessage) and isinstance(msg.content, str) else msg
+                                for msg in message_list]
             chat_result, is_ai_chat = self.get_block_result(
                 message_list,
                 chat_model,
@@ -750,6 +767,7 @@ class BaseChatStep(IChatStep):
                 chat_id,
                 chat_user_id,
                 chat_user_type,
+                actual_usage=usage,
             )
             # DPin actual-usage contract v1
             # Only the OpenAI application API requires this strict contract.
@@ -776,6 +794,16 @@ class BaseChatStep(IChatStep):
                 reasoning_content = (reasoning_result.get("reasoning_content") or "") + (
                     reasoning_result_end.get("reasoning_content") or ""
                 )
+            if usage is not None:
+                extract_long_term_memory_for_request(
+                    manage.context.get('workspace_id'), manage.context.get('application_id'), chat_user_id,
+                    manage.context.get('actual_memory_config'), usage, (problem_text, content),
+                )
+                request_token, response_token = usage.finalize()
+                manage.context['message_tokens'] = request_token
+                manage.context['answer_tokens'] = response_token
+                manage.context['actual_usage_calls'] = usage.details()
+                manage.context['run_time'] = time.time() - manage.context['start_time']
             post_response_handler.handler(
                 chat_id,
                 chat_record_id,
@@ -799,6 +827,7 @@ class BaseChatStep(IChatStep):
                 {
                     "reasoning_content": reasoning_content if reasoning_content_enable else "",
                     "usage_source": "upstream" if actual_usage_verified else "unverified",
+                    **({'actual_usage': usage} if usage is not None else {}),
                     "answer_list": [
                         {"content": content, "reasoning_content": reasoning_content if reasoning_content_enable else ""}
                     ],
@@ -806,8 +835,13 @@ class BaseChatStep(IChatStep):
             )
         except ActualUsageUnavailable:
             # No reply or synthetic zero usage is persisted for a failed contract.
+            if manage.actual_usage is not None:
+                manage.actual_usage.fail(None)
             return manage.get_base_to_response().actual_usage_error()
         except Exception as e:
+            if manage.actual_usage is not None:
+                manage.actual_usage.fail(None)
+                return manage.get_base_to_response().actual_usage_error()
             all_text = "Exception:" + str(e)
             write_context(self, manage, 0, 0, all_text)
             post_response_handler.handler(

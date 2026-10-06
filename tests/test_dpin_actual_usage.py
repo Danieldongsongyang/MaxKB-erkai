@@ -83,6 +83,13 @@ class ActualUsageTests(unittest.TestCase):
             actual = list(executor.map(request, range(64)))
         self.assertEqual(actual, [(i + 2, i + 1) for i in range(64)])
 
+    def test_concurrent_completion_inside_one_request(self):
+        usage = RequestActualUsage()
+        calls = [usage.begin('reply') for _ in range(32)]
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(lambda item: usage.complete(item[1], message(item[0], 1)), enumerate(calls)))
+        self.assertEqual(usage.finalize(), (sum(range(32)), 32))
+
 
 if __name__ == '__main__':
     unittest.main()

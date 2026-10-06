@@ -13,6 +13,8 @@ from typing import List, Type, Dict
 from application.chat_pipeline.I_base_chat_pipeline import IBaseChatPipelineStep
 from common.handle.base_to_response import BaseToResponse
 from common.handle.impl.response.system_to_response import SystemToResponse
+from common.handle.impl.response.openai_to_response import OpenaiToResponse
+from common.handle.dpin_actual_usage import ActualUsageUnavailable, RequestActualUsage
 
 
 class PipelineManage:
@@ -26,6 +28,7 @@ class PipelineManage:
         self.context = {'message_tokens': 0, 'answer_tokens': 0}
         self.base_to_response = base_to_response
         self.debug = debug
+        self.actual_usage = RequestActualUsage() if isinstance(base_to_response, OpenaiToResponse) else None
 
     def run(self, context: Dict = None):
         self.context['start_time'] = time.time()
@@ -34,7 +37,13 @@ class PipelineManage:
                 self.context[key] = value
         for step in self.step_list:
             self.run_step_list.append(step)
-            step.run(self)
+            try:
+                step.run(self)
+            except ActualUsageUnavailable:
+                if self.actual_usage is None:
+                    raise
+                self.context['chat_result'] = self.base_to_response.actual_usage_error()
+                return
 
     def get_details(self):
         return reduce(lambda x, y: {**x, **y}, [{item.get('step_type'): item} for item in

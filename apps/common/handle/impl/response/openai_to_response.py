@@ -17,6 +17,7 @@ from openai.types.chat.chat_completion_chunk import Choice, ChoiceDelta
 from rest_framework import status
 
 from common.handle.base_to_response import BaseToResponse
+from common.handle.dpin_actual_usage import ActualUsageUnavailable, RequestActualUsage
 
 
 class OpenaiToResponse(BaseToResponse):
@@ -25,6 +26,17 @@ class OpenaiToResponse(BaseToResponse):
                           _status=status.HTTP_200_OK):
         if other_params is None:
             other_params = {}
+        if _status == status.HTTP_200_OK:
+            usage = other_params.get('actual_usage')
+            if not isinstance(usage, RequestActualUsage) or other_params.get('usage_source') != 'upstream':
+                return self.actual_usage_error()
+            try:
+                actual_prompt, actual_completion = usage.finalize()
+            except ActualUsageUnavailable:
+                return self.actual_usage_error()
+            if (type(prompt_tokens) is not int or type(completion_tokens) is not int
+                    or (prompt_tokens, completion_tokens) != (actual_prompt, actual_completion)):
+                return self.actual_usage_error()
         data = ChatCompletion(id=chat_record_id, choices=[
             BlockChoice(finish_reason='stop', index=0, chat_id=chat_id,
                         answer_list=other_params.get('answer_list', ""),
@@ -36,9 +48,8 @@ class OpenaiToResponse(BaseToResponse):
                               ).dict()
         # DPin actual-usage contract v1
         if _status == status.HTTP_200_OK:
-            if other_params.get("usage_source") != "upstream":
-                return self.actual_usage_error()
             data["usage"]["usage_source"] = "upstream"
+            data['usage']['calls'] = usage.details()
         return JsonResponse(data=data, status=_status)
 
     def actual_usage_error(self, code="MAXKB_ACTUAL_USAGE_UNAVAILABLE"):

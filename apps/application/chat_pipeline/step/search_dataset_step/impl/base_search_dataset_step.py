@@ -16,6 +16,7 @@ from rest_framework.utils.formatting import lazy_format
 from application.chat_pipeline.I_base_chat_pipeline import ParagraphPipelineModel
 from application.chat_pipeline.step.search_dataset_step.i_search_dataset_step import ISearchDatasetStep
 from common.config.embedding_config import VectorStore, ModelManage
+from common.handle.dpin_actual_usage import ActualUsageUnavailable
 from common.constants.permission_constants import RoleConstants
 from common.database_model_manage.database_model_manage import DatabaseModelManage
 from common.db.search import native_search
@@ -58,6 +59,9 @@ class BaseSearchDatasetStep(ISearchDatasetStep):
                                                                  knowledge_id_list)
         if len(knowledge_id_list) == 0:
             return []
+        if manage.actual_usage is not None:
+            # embed_query 只返回向量，无本次实际用量；不能静默把检索算作零用量。
+            raise ActualUsageUnavailable()
         exec_problem_text = padding_problem_text if padding_problem_text is not None else problem_text
         model_id = get_embedding_id(knowledge_id_list)
         model = get_model_by_id(model_id, workspace_id)

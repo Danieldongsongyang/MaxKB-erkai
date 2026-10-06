@@ -1,4 +1,5 @@
 import re
+from copy import deepcopy
 from datetime import timedelta
 
 import uuid_utils.compat as uuid
@@ -11,6 +12,7 @@ from application.models import Chat, ChatRecord, Application, ApplicationLongTer
 from common.utils.logger import maxkb_logger
 from models_provider.tools import get_model_instance_by_model_workspace_id
 from ops import celery_app
+from common.handle.dpin_actual_usage import ActualUsageUnavailable
 
 long_term_prompt = '''
 你是一个专业的用户长期记忆提炼引擎。你的唯一职责是：从对话中精确识别具有持久价值的用户信息，并与已有记忆进行结构化融合，输出供 AI 助手长期使用的用户画像记忆。
@@ -213,13 +215,51 @@ def _get_since_time_from_setting(setting: dict):
     return None
 
 
-def _run_extract(workspace_id, application_id, chat_user_id, config, history_limit=None, since_time=None):
+def request_memory_config(application, chat_user_id):
+    """冻结既有实时记忆配置；定时调用不属于单次聊天，不能冒充已归集。"""
+    if application is None:
+        raise ActualUsageUnavailable()
+    if application.type != 'SIMPLE':
+        raise ActualUsageUnavailable()
+    if not application.long_term_enable:
+        return None
+    config = deepcopy(_get_long_term_config(application, chat_user_id))
+    if (config is None or config['trigger_type'] != 'ROUND'
+            or not isinstance(config['trigger_setting'], dict) or not isinstance(config['model_params'], dict)):
+        raise ActualUsageUnavailable()
+    rounds = config['trigger_setting'].get('rounds', 10)
+    if type(rounds) is not int or rounds <= 0 or not config['model_id']:
+        raise ActualUsageUnavailable()
+    return config
+
+
+def extract_long_term_memory_for_request(workspace_id, application_id, chat_user_id, config,
+                                         actual_usage, current_conversation):
+    """在当前回复持久化前提取；本轮对话显式传入，不依赖 Celery 延迟或聊天缓存共享状态。"""
+    if config is None:
+        return
+    if config['trigger_type'] != 'ROUND':
+        raise ActualUsageUnavailable()
+    rounds = config['trigger_setting'].get('rounds', 10)
+    if type(rounds) is not int or rounds <= 0:
+        raise ActualUsageUnavailable()
+    current_rounds = QuerySet(ChatRecord).filter(
+        chat__application_id=application_id, chat__chat_user_id=chat_user_id,
+    ).count() + 1
+    if current_rounds % rounds != 0:
+        return
+    _run_extract(workspace_id, application_id, chat_user_id, config, history_limit=rounds - 1,
+                 actual_usage=actual_usage, current_conversation=current_conversation)
+
+
+def _run_extract(workspace_id, application_id, chat_user_id, config, history_limit=None, since_time=None,
+                 actual_usage=None, current_conversation=None):
     """
     执行一次长期记忆提取。
     - since_time 不为 None 时：提取该时间点之后产生的对话。
     - 否则按 history_limit 条数限制。
     """
-    if since_time is None and (history_limit is None or history_limit <= 0):
+    if current_conversation is None and since_time is None and (history_limit is None or history_limit <= 0):
         return
 
     qs = (
@@ -236,13 +276,15 @@ def _run_extract(workspace_id, application_id, chat_user_id, config, history_lim
         history_chat_record = list(qs.filter(create_time__gte=since_time))
     else:
         history_chat_record = list(qs[:history_limit])
-    if len(history_chat_record) == 0:
+    if len(history_chat_record) == 0 and current_conversation is None:
         return
 
     chat_model = get_model_instance_by_model_workspace_id(
         config['model_id'], workspace_id, **config['model_params']
     )
     if not chat_model:
+        if actual_usage is not None:
+            raise ActualUsageUnavailable()
         return
 
     long_term_memory = QuerySet(ApplicationLongTermMemory).filter(
@@ -259,16 +301,24 @@ def _run_extract(workspace_id, application_id, chat_user_id, config, history_lim
         for record in history_chat_record
         for line in (f"用户：{record.problem_text}", f"AI：{record.answer_text}")
     )
+    if current_conversation is not None:
+        problem_text, answer_text = current_conversation
+        new_conversation += f'\n用户：{problem_text}\nAI：{answer_text}'
 
-    content = ''
-    for chunk in chat_model.stream([
+    messages = [
         HumanMessage(
             content=long_term_prompt
                     .replace('{{existing_memory}}', existing_memory)
                     .replace('{{new_conversation}}', new_conversation)
         )
-    ]):
-        content += chunk.content
+    ]
+    if actual_usage is not None:
+        # 一个实际 invoke 的响应携带本次用量；不从模型实例的共享 last_generation_info 读取。
+        content = actual_usage.invoke('long_term_memory', chat_model, messages).content
+    else:
+        content = ''
+        for chunk in chat_model.stream(messages):
+            content += chunk.content
 
     content = re.sub(r'<think>.*?<\/think>', '', content, flags=re.DOTALL).strip()
 
