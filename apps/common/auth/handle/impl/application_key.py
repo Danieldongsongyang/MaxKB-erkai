@@ -11,6 +11,7 @@ from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 from application.models import ApplicationApiKey, ChatUserType, ApplicationAccessToken
+from common.handle.dpin_scope import authenticated_dpin_scope
 from common.auth.handle.auth_base_handle import AuthBaseHandle
 from common.constants.permission_constants import Permission, Group, Operate, RoleConstants, ChatAuth
 from common.exception.app_exception import AppAuthenticationFailed
@@ -32,13 +33,14 @@ class ApplicationKey(AuthBaseHandle):
                 if application_access_token.authentication_value.get('type',
                                                                      'password') != 'password':
                     raise AppAuthenticationFailed(1002, _('Authentication information is incorrect'))
+        scope = authenticated_dpin_scope(request, application_api_key.application_id)
         return None, ChatAuth(
             current_role_list=[RoleConstants.CHAT_ANONYMOUS_USER],
             permission_list=[
                 Permission(group=Group.APPLICATION,
                            operate=Operate.READ)],
             application_id=application_api_key.application_id,
-            chat_user_id=str(application_api_key.id),
+            chat_user_id=scope or str(application_api_key.id),
             chat_user_type=ChatUserType.APPLICATION_API_KEY.value)
 
     def support(self, request, token: str, get_token_details):

@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'apps'))
-from common.handle.dpin_actual_usage import MAX_TOKENS, ActualUsageUnavailable, RequestActualUsage, actual_token_usage
+from common.handle.dpin_actual_usage import MAX_TOKENS, ActualUsageUnavailable, RequestActualUsage, actual_token_usage, actual_cached_tokens
 
 
 def message(prompt=2, completion=3, response_id=None):
@@ -36,6 +36,43 @@ class ActualUsageTests(unittest.TestCase):
             value.response_metadata = {'token_usage': other}
             with self.subTest(other=other), self.assertRaises(ActualUsageUnavailable):
                 actual_token_usage(value)
+
+    def test_cache_facts_are_explicit_consistent_and_bounded(self):
+        value = message(9, 2)
+        self.assertIsNone(actual_cached_tokens(value, 9))
+        for hit in [0, 4, 9]:
+            value.usage_metadata['input_token_details'] = {'cache_read': hit}
+            value.response_metadata = {'token_usage': {'prompt_tokens': 9, 'completion_tokens': 2,
+                'prompt_cache_hit_tokens': hit, 'prompt_cache_miss_tokens': 9-hit,
+                'prompt_tokens_details': {'cached_tokens': hit}}}
+            usage = RequestActualUsage()
+            usage.complete(usage.begin('reply'), value)
+            self.assertEqual(usage.cached_tokens(), hit)
+            self.assertEqual(usage.details()[0]['cached_tokens'], hit)
+        for hit in [None, True, -1, 10, 1.5]:
+            value = message(9, 2)
+            value.usage_metadata['input_token_details'] = {'cache_read': hit}
+            with self.subTest(hit=hit), self.assertRaises(ActualUsageUnavailable):
+                actual_cached_tokens(value, 9)
+        value = message(9, 2)
+        value.usage_metadata['input_token_details'] = {'cache_read': 3}
+        for raw in [{'prompt_cache_hit_tokens': 4},
+                    {'prompt_cache_hit_tokens': 3, 'prompt_cache_miss_tokens': 5}]:
+            value.response_metadata = {'token_usage': raw}
+            with self.assertRaises(ActualUsageUnavailable):
+                actual_cached_tokens(value, 9)
+
+    def test_cache_aggregates_every_call_and_missing_is_unknown(self):
+        usage = RequestActualUsage()
+        for purpose, hit in [('problem_optimization', 0), ('reply', 1), ('long_term_memory', 2)]:
+            value = message(3, 1)
+            value.usage_metadata['input_token_details'] = {'cache_read': hit}
+            usage.complete(usage.begin(purpose), value)
+        self.assertEqual(usage.cached_tokens(), 3)
+        unknown = RequestActualUsage()
+        unknown.complete(unknown.begin('reply'), message())
+        self.assertIsNone(unknown.cached_tokens())
+        self.assertNotIn('cached_tokens', unknown.details()[0])
 
     def test_multiple_calls_sum_and_seal(self):
         usage = RequestActualUsage()

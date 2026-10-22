@@ -15,6 +15,7 @@ import uuid
 from abc import abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
+from contextlib import nullcontext
 from functools import reduce
 from pathlib import Path
 from threading import Event
@@ -111,7 +112,7 @@ class ChatModel:
         if self.failure == 'exception':
             raise RuntimeError('敏感上游错误不得返回')
         usage = None if self.failure == 'missing' else {
-            'input_tokens': self.prompt, 'output_tokens': self.completion, 'total_tokens': self.prompt + self.completion}
+            'input_tokens': self.prompt, 'output_tokens': self.completion, 'total_tokens': self.prompt + self.completion, 'input_token_details': {'cache_read': 0}}
         response = {'token_usage': {'prompt_tokens': self.prompt + 1, 'completion_tokens': self.completion}}
         return AIMessage(content=self.content, usage_metadata=usage, id=self.purpose,
                          response_metadata=response if self.failure == 'inconsistent' else {})
@@ -135,7 +136,8 @@ class Step:
 
 
 async_extract = SimpleNamespace(apply_async=Mock())
-ns = dict(time=time, re=re, deepcopy=copy.deepcopy, reduce=reduce, status=status, abstractmethod=abstractmethod,
+Memory.objects = SimpleNamespace(update_or_create=lambda **kw: Memory(**kw['defaults']).save())
+ns = dict(transaction=SimpleNamespace(atomic=nullcontext), nullcontext=nullcontext, time=time, re=re, deepcopy=copy.deepcopy, reduce=reduce, status=status, abstractmethod=abstractmethod,
           uuid=SimpleNamespace(uuid7=uuid.uuid4), IChatStep=Step, IResetProblemStep=Step,
           AIMessage=AIMessage, AIMessageChunk=AIMessageChunk, HumanMessage=HumanMessage, SystemMessage=SystemMessage,
           ActualUsageUnavailable=ActualUsageUnavailable, RequestActualUsage=RequestActualUsage,
@@ -349,8 +351,24 @@ class PipelineUsageTests(unittest.TestCase):
                                                 {'usage_source': 'upstream', 'actual_usage': ledger})
             self.assertEqual(result.status_code, 502)
 
+    def test_response_publishes_aggregate_cache_facts(self):
+        usage = RequestActualUsage()
+        for purpose, hit in [('problem_optimization', 0), ('reply', 2), ('long_term_memory', 1)]:
+            message = AIMessage(content='替身', usage_metadata={
+                'input_tokens': 3, 'output_tokens': 1, 'total_tokens': 4,
+                'input_token_details': {'cache_read': hit}})
+            usage.complete(usage.begin(purpose), message)
+        result = OpenaiToResponse().to_block_response(
+            'chat', 'record', '替身', True, 9, 3,
+            {'usage_source': 'upstream', 'actual_usage': usage})
+        self.assertEqual(result.status_code, 200)
+        returned = json.loads(result.content)['usage']
+        self.assertEqual(returned['prompt_tokens_details']['cached_tokens'], 3)
+        self.assertEqual(returned['cache_usage_source'], 'upstream')
+        self.assertEqual([call['cached_tokens'] for call in returned['calls']], [0, 2, 1])
+
     def test_serializer_rejects_unknown_consumers_without_disabling_configuration(self):
-        for unsupported in ['stream', 'knowledge', 'workflow', 'mcp', 'tool', 'application', 'skill', 'scheduled']:
+        for unsupported in ['stream', 'workflow', 'mcp', 'tool', 'application', 'skill', 'scheduled']:
             current = fixture()
             app = current.application
             app.mcp_enable = app.tool_enable = app.application_enable = False
@@ -387,7 +405,7 @@ class PipelineUsageTests(unittest.TestCase):
         app.mcp_enable = app.tool_enable = app.application_enable = False
         app.skill_tool_ids = []
         app.problem_optimization = True
-        info = SimpleNamespace(application=app, knowledge_id_list=[], get_application=lambda: app,
+        info = SimpleNamespace(application=app, knowledge_id_list=['local-knowledge'], get_application=lambda: app,
                                get_chat_user=lambda **kwargs: None)
         serializer = ns['ChatSerializers']()
         serializer.data = {'debug': True}

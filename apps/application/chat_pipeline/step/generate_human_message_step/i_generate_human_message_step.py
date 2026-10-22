@@ -50,7 +50,7 @@ class IGenerateHumanMessageStep(IBaseChatPipelineStep):
         return self.InstanceSerializer
 
     def _run(self, manage: PipelineManage):
-        message_list = self.execute(**self.context['step_args'])
+        message_list = self.execute(**self.context['step_args'], manage=manage)
         manage.context['message_list'] = message_list
 
     @abstractmethod

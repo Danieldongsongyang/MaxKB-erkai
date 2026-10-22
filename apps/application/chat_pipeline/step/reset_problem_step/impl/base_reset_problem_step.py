@@ -14,7 +14,7 @@ from langchain_core.messages import HumanMessage
 from application.chat_pipeline.step.reset_problem_step.i_reset_problem_step import IResetProblemStep
 from application.models import ChatRecord
 from common.utils.split_model import flat_map
-from common.handle.dpin_actual_usage import actual_token_usage
+from common.handle.dpin_actual_usage import actual_token_usage, ActualUsageUnavailable
 from models_provider.tools import get_model_instance_by_model_workspace_id
 
 prompt = _(
@@ -29,12 +29,18 @@ class BaseResetProblemStep(IResetProblemStep):
                 **kwargs) -> str:
         chat_model = get_model_instance_by_model_workspace_id(model_id, workspace_id) if model_id is not None else None
         if chat_model is None:
+            if manage is not None and manage.actual_usage is not None:
+                raise ActualUsageUnavailable()
             return problem_text
         start_index = len(history_chat_record) - 3
         history_message = [[history_chat_record[index].get_human_message(), history_chat_record[index].get_ai_message()]
                            for index in
                            range(start_index if start_index > 0 else 0, len(history_chat_record))]
         reset_prompt = problem_optimization_prompt if problem_optimization_prompt else prompt
+        reply_context = manage.context.get('dpin_reply_context') if manage is not None else None
+        if reply_context:
+            history_message = []
+            problem_text = '\n'.join(item['role'] + '：' + item['text'] for item in reply_context['messages'])
         message_list = [*flat_map(history_message),
                         HumanMessage(content=reset_prompt.replace('{question}', problem_text))]
         usage = manage.actual_usage if manage is not None else None

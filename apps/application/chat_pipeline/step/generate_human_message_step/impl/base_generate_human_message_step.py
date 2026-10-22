@@ -15,6 +15,7 @@ from application.chat_pipeline.step.generate_human_message_step.i_generate_human
     IGenerateHumanMessageStep
 from application.models import ChatRecord
 from common.utils.common import flat_map
+from common.handle.dpin_reply_context import SYSTEM_PROMPT, reply_problem
 
 
 class BaseGenerateHumanMessageStep(IGenerateHumanMessageStep):
@@ -28,10 +29,17 @@ class BaseGenerateHumanMessageStep(IGenerateHumanMessageStep):
                 padding_problem_text: str = None,
                 no_references_setting=None,
                 system=None,
+                manage=None,
                 **kwargs) -> List[BaseMessage]:
         prompt = prompt if (paragraph_list is not None and len(paragraph_list) > 0) else no_references_setting.get(
             'value')
         exec_problem_text = padding_problem_text if padding_problem_text is not None else problem_text
+        reply_context = manage.context.get('dpin_reply_context') if manage is not None else None
+        if reply_context:
+            configured_system = [SystemMessage(system)] if system else []
+            return [*configured_system, SystemMessage(SYSTEM_PROMPT),
+                    self.to_human_message(prompt, reply_problem(reply_context), max_paragraph_char_number,
+                                          paragraph_list, no_references_setting)]
         start_index = len(history_chat_record) - dialogue_number
         history_message = [[history_chat_record[index].get_human_message(), history_chat_record[index].get_ai_message()]
                            for index in

@@ -13,6 +13,11 @@ from typing import List, Dict
 
 import uuid_utils.compat as uuid
 from django.db.models import QuerySet
+from django.db import transaction
+from django.core.cache import cache
+from common.handle.dpin_scope import serialized_dpin_scope, DpinConversationConflict
+from common.handle.dpin_reply_context import parse_reply_context
+from common.constants.cache_version import Cache_Version
 from django.utils.translation import gettext_lazy as _
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from rest_framework import serializers
@@ -123,13 +128,18 @@ def get_post_handler(chat_info: ChatInfo):
                                      answer_tokens=manage.context['answer_tokens'],
                                      answer_text_list=answer_list,
                                      run_time=manage.context['run_time'],
-                                     index=len(chat_info.chat_record_list) + 1,
+                                     index=(QuerySet(ChatRecord).filter(chat_id=chat_id).count() + 1
+                                            if manage.actual_usage is not None else len(chat_info.chat_record_list) + 1),
                                      ip_address=chat_info.ip_address,
                                      source=chat_info.source
                                      )
             chat_info.append_chat_record(chat_record)
             # 重新设置缓存
-            chat_info.set_cache()
+            if manage.actual_usage is not None:
+                # 聊天与记忆提交后才发布缓存；缓存失败不把已提交回复伪装成事务失败。
+                transaction.on_commit(chat_info.set_cache, robust=True)
+            else:
+                chat_info.set_cache()
 
     return PostHandler()
 
@@ -251,6 +261,29 @@ class OpenAIChatSerializer(serializers.Serializer):
         return chat_id
 
     def chat(self, instance: Dict, with_valid=True):
+        self.is_valid(raise_exception=True)
+        source = self.data.get('source') or {}
+        if source.get('dpin_scope_version') != 1:
+            return self._chat(instance, with_valid)
+        application_id, scope = self.data['application_id'], self.data['chat_user_id']
+        with serialized_dpin_scope(application_id, scope):
+            chat_id = instance.get('chat_id')
+            if chat_id:
+                # 先验证持久化归属，再清理缓存；不能清理其他候选人的缓存。
+                if not QuerySet(Chat).filter(id=chat_id, application_id=application_id,
+                                             chat_user_id=scope, source__dpin_scope_version=1).exists():
+                    raise DpinConversationConflict(409, '会话不属于当前应聘者，或属于旧共享作用域')
+                cache.delete(Cache_Version.CHAT.get_key(key=str(chat_id)),
+                             version=Cache_Version.CHAT_INFO.get_version())
+            try:
+                return self._chat(instance, with_valid)
+            finally:
+                # 持久化是事实来源。失败时也不能把未提交记录保留在缓存。
+                if chat_id:
+                    cache.delete(Cache_Version.CHAT.get_key(key=str(chat_id)),
+                                 version=Cache_Version.CHAT_INFO.get_version())
+
+    def _chat(self, instance: Dict, with_valid=True):
         if with_valid:
             self.is_valid(raise_exception=True)
             OpenAIInstanceSerializer(data=instance).is_valid(raise_exception=True)
@@ -373,6 +406,10 @@ class ChatSerializers(serializers.Serializer):
         params = chat_info.to_pipeline_manage_params(message, get_post_handler(chat_info), exclude_paragraph_id_list,
                                                      chat_user_id, chat_user_type, ip_address, source, stream,
                                                      form_data)
+        reply_context = parse_reply_context(message, chat_user_id if (source or {}).get('dpin_scope_version') == 1 else None)
+        if reply_context:
+            params['dpin_reply_context'] = reply_context
+            params['history_chat_record'] = []
         if chat_record_id:
             params['chat_record_id'] = chat_record_id
         if isinstance(base_to_response, OpenaiToResponse):
@@ -382,6 +419,8 @@ class ChatSerializers(serializers.Serializer):
                 params['actual_memory_config'] = request_memory_config(active_application, chat_user_id)
             except ActualUsageUnavailable:
                 return base_to_response.actual_usage_error('MAXKB_ACTUAL_USAGE_UNSUPPORTED')
+        if (source or {}).get('dpin_scope_version') == 1:
+            params['dpin_scope'] = chat_user_id
         chat_info.set_chat(message)
         # 运行流水线作业
         pipeline_message.run(params)
@@ -482,7 +521,7 @@ class ChatSerializers(serializers.Serializer):
         if isinstance(base_to_response, OpenaiToResponse):
             application = chat_info.application
             if application.type != ApplicationTypeChoices.SIMPLE or any((
-                instance.get('stream'), chat_info.knowledge_id_list,
+                instance.get('stream'),
                 application.mcp_enable, application.tool_enable, application.application_enable,
                 application.skill_tool_ids,
                 application.long_term_enable and application.long_term_trigger_type != 'ROUND',
@@ -541,7 +580,8 @@ class ChatSerializers(serializers.Serializer):
                              self.data.get('ip_address'),
                              self.data.get('source'), knowledge_id_list,
                              exclude_document_id_list, application.id)
-        chat_record_list = list(QuerySet(ChatRecord).filter(chat_id=chat_id).order_by('-create_time')[0:5])
+        limit = 20 if (self.data.get('source') or {}).get('dpin_scope_version') == 1 else 5
+        chat_record_list = list(QuerySet(ChatRecord).filter(chat_id=chat_id).order_by('-create_time')[0:limit])
         chat_record_list.sort(key=lambda r: r.create_time)
         for chat_record in chat_record_list:
             chat_info.chat_record_list.append(chat_record)

@@ -13,6 +13,7 @@ from common.utils.logger import maxkb_logger
 from models_provider.tools import get_model_instance_by_model_workspace_id
 from ops import celery_app
 from common.handle.dpin_actual_usage import ActualUsageUnavailable
+from common.handle.dpin_reply_context import candidate_memory_facts
 
 long_term_prompt = '''
 你是一个专业的用户长期记忆提炼引擎。你的唯一职责是：从对话中精确识别具有持久价值的用户信息，并与已有记忆进行结构化融合，输出供 AI 助手长期使用的用户画像记忆。
@@ -234,7 +235,7 @@ def request_memory_config(application, chat_user_id):
 
 
 def extract_long_term_memory_for_request(workspace_id, application_id, chat_user_id, config,
-                                         actual_usage, current_conversation):
+                                         actual_usage, current_conversation, reply_context=None):
     """在当前回复持久化前提取；本轮对话显式传入，不依赖 Celery 延迟或聊天缓存共享状态。"""
     if config is None:
         return
@@ -248,12 +249,16 @@ def extract_long_term_memory_for_request(workspace_id, application_id, chat_user
     ).count() + 1
     if current_rounds % rounds != 0:
         return
-    _run_extract(workspace_id, application_id, chat_user_id, config, history_limit=rounds - 1,
+    if reply_context is not None:
+        return _run_extract(workspace_id, application_id, chat_user_id, config, history_limit=0,
+                            actual_usage=actual_usage, current_conversation=(candidate_memory_facts(reply_context), ''),
+                            memory_user_id=reply_context['memory_user_id'])
+    return _run_extract(workspace_id, application_id, chat_user_id, config, history_limit=rounds - 1,
                  actual_usage=actual_usage, current_conversation=current_conversation)
 
 
 def _run_extract(workspace_id, application_id, chat_user_id, config, history_limit=None, since_time=None,
-                 actual_usage=None, current_conversation=None):
+                 actual_usage=None, current_conversation=None, memory_user_id=None):
     """
     执行一次长期记忆提取。
     - since_time 不为 None 时：提取该时间点之后产生的对话。
@@ -287,8 +292,9 @@ def _run_extract(workspace_id, application_id, chat_user_id, config, history_lim
             raise ActualUsageUnavailable()
         return
 
+    memory_user_id = memory_user_id or chat_user_id
     long_term_memory = QuerySet(ApplicationLongTermMemory).filter(
-        application_id=application_id, chat_user_id=chat_user_id
+        application_id=application_id, chat_user_id=memory_user_id
     ).first()
 
     existing_memory = long_term_memory.memory if long_term_memory else ''
@@ -322,6 +328,8 @@ def _run_extract(workspace_id, application_id, chat_user_id, config, history_lim
 
     content = re.sub(r'<think>.*?<\/think>', '', content, flags=re.DOTALL).strip()
 
+    if actual_usage is not None:
+        return {'application_id': application_id, 'chat_user_id': memory_user_id, 'memory': content}
     if long_term_memory:
         long_term_memory.memory = content
         long_term_memory.save()

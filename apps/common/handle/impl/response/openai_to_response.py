@@ -46,10 +46,20 @@ class OpenaiToResponse(BaseToResponse):
                                                     prompt_tokens=prompt_tokens,
                                                     total_tokens=completion_tokens + prompt_tokens)
                               ).dict()
-        # DPin actual-usage contract v1
+        # DPin actual-usage contract v2
         if _status == status.HTTP_200_OK:
             data["usage"]["usage_source"] = "upstream"
             data['usage']['calls'] = usage.details()
+            if other_params.get('dpin_scope'):
+                data['dpin_scope'] = other_params['dpin_scope']
+            if other_params.get('reply_protocol'):
+                data['reply_protocol'] = other_params['reply_protocol']
+            cached_tokens = usage.cached_tokens()
+            if cached_tokens is not None:
+                data['usage']['prompt_tokens_details'] = {'cached_tokens': cached_tokens}
+                data['usage']['cache_usage_source'] = 'upstream'
+            if 'retrieval' in other_params:
+                data['usage']['retrieval'] = other_params['retrieval']
         return JsonResponse(data=data, status=_status)
 
     def actual_usage_error(self, code="MAXKB_ACTUAL_USAGE_UNAVAILABLE"):

@@ -83,11 +83,14 @@ class OpenAIView(APIView):
         ip_address = _get_ip_address(request)
         if application_id != str(request.auth.application_id):
             raise AppAuthenticationFailed(500, _('Secret key is invalid'))
+        source = {"type": ChatSourceChoices.API_CALL.value}
+        if getattr(request, 'dpin_scope_verified', False):
+            source['dpin_scope_version'] = 1
         return OpenAIChatSerializer(
             data={'application_id': application_id, 'chat_user_id': request.auth.chat_user_id,
                   'chat_user_type': request.auth.chat_user_type,
                   'ip_address': ip_address,
-                  'source': {"type": ChatSourceChoices.API_CALL.value}}).chat(request.data)
+                  'source': source}).chat(request.data)
 
 
 class AnonymousAuthentication(APIView):

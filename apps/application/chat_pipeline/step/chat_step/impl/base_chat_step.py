@@ -8,6 +8,8 @@
 """
 
 from common.handle.dpin_actual_usage import actual_token_usage, ActualUsageUnavailable
+from django.db import transaction
+from contextlib import nullcontext
 from common.handle.impl.response.openai_to_response import OpenaiToResponse
 
 import json
@@ -740,9 +742,10 @@ class BaseChatStep(IChatStep):
             ):
                 raise ActualUsageUnavailable()
             usage = manage.actual_usage
+            reply_context = manage.context.get('dpin_reply_context')
             if usage is not None and manage.context.get('actual_memory_config') is not None:
                 memory_row = QuerySet(ApplicationLongTermMemory).filter(
-                    chat_user_id=chat_user_id, application_id=manage.context.get('application_id'),
+                    chat_user_id=reply_context['memory_user_id'] if reply_context else chat_user_id, application_id=manage.context.get('application_id'),
                 ).first()
                 memory = memory_row.memory if memory_row is not None else ''
                 # 系统消息可能来自会话缓存；使用副本，不能跨请求替换共享消息上的占位符。
@@ -795,44 +798,62 @@ class BaseChatStep(IChatStep):
                     reasoning_result_end.get("reasoning_content") or ""
                 )
             if usage is not None:
-                extract_long_term_memory_for_request(
+                pending_memory = extract_long_term_memory_for_request(
                     manage.context.get('workspace_id'), manage.context.get('application_id'), chat_user_id,
                     manage.context.get('actual_memory_config'), usage, (problem_text, content),
+                    **({'reply_context': reply_context} if reply_context else {}),
                 )
                 request_token, response_token = usage.finalize()
+                if usage.cached_tokens() is None:
+                    raise ActualUsageUnavailable()
+                manage.context['pending_memory'] = pending_memory
                 manage.context['message_tokens'] = request_token
                 manage.context['answer_tokens'] = response_token
                 manage.context['actual_usage_calls'] = usage.details()
                 manage.context['run_time'] = time.time() - manage.context['start_time']
-            post_response_handler.handler(
-                chat_id,
-                chat_record_id,
-                paragraph_list,
-                problem_text,
-                content,
-                manage,
-                self,
-                padding_problem_text,
-                reasoning_content=reasoning_content,
-            )
-            if not manage.debug:
-                add_access_num(chat_user_id, chat_user_type, manage.context.get("application_id"))
-            return manage.get_base_to_response().to_block_response(
-                str(chat_id),
-                str(chat_record_id),
-                content,
-                True,
-                request_token,
-                response_token,
-                {
-                    "reasoning_content": reasoning_content if reasoning_content_enable else "",
-                    "usage_source": "upstream" if actual_usage_verified else "unverified",
-                    **({'actual_usage': usage} if usage is not None else {}),
-                    "answer_list": [
-                        {"content": content, "reasoning_content": reasoning_content if reasoning_content_enable else ""}
-                    ],
-                },
-            )
+            with transaction.atomic() if usage is not None else nullcontext():
+                if usage is not None and manage.context.get('pending_memory') is not None:
+                    pending = manage.context['pending_memory']
+                    ApplicationLongTermMemory.objects.update_or_create(
+                        application_id=pending['application_id'], chat_user_id=pending['chat_user_id'],
+                        defaults={'memory': pending['memory']},
+                    )
+                post_response_handler.handler(
+                    chat_id,
+                    chat_record_id,
+                    paragraph_list,
+                    problem_text,
+                    content,
+                    manage,
+                    self,
+                    padding_problem_text,
+                    reasoning_content=reasoning_content,
+                )
+                if not manage.debug:
+                    add_access_num(chat_user_id, chat_user_type, manage.context.get("application_id"))
+                response = manage.get_base_to_response().to_block_response(
+                    str(chat_id),
+                    str(chat_record_id),
+                    content,
+                    True,
+                    request_token,
+                    response_token,
+                    {
+                        "reasoning_content": reasoning_content if reasoning_content_enable else "",
+                        "usage_source": "upstream" if actual_usage_verified else "unverified",
+                        **({'actual_usage': usage} if usage is not None else {}),
+                        **({'retrieval': manage.context['retrieval_usage']} if 'retrieval_usage' in manage.context else {}),
+                        **({"dpin_scope": manage.context["dpin_scope"]} if "dpin_scope" in manage.context else {}),
+                        **({'reply_protocol': reply_context['protocol']} if reply_context else {}),
+                        "answer_list": [
+                            {"content": content, "reasoning_content": reasoning_content if reasoning_content_enable else ""}
+                        ],
+                    },
+                )
+                if usage is not None and response.status_code != 200:
+                    raise ActualUsageUnavailable()
+            return response
+
         except ActualUsageUnavailable:
             # No reply or synthetic zero usage is persisted for a failed contract.
             if manage.actual_usage is not None:

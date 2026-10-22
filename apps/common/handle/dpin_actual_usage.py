@@ -70,6 +70,41 @@ def actual_token_usage(message):
     return selected
 
 
+def actual_cached_tokens(message, prompt_tokens):
+    """缓存命中必须有本次响应的显式事实；缺字段返回未知，绝不补零。"""
+    candidates = []
+    metadata = getattr(message, "usage_metadata", None)
+    response = getattr(message, "response_metadata", None)
+    sources = []
+    if isinstance(metadata, dict):
+        sources.append((metadata, "input_token_details", "cache_read"))
+    if isinstance(response, dict) and isinstance(response.get("token_usage"), dict):
+        raw = response["token_usage"]
+        sources.append((raw, "prompt_tokens_details", "cached_tokens"))
+        if "prompt_cache_hit_tokens" in raw:
+            candidates.append(raw["prompt_cache_hit_tokens"])
+        if "prompt_cache_miss_tokens" in raw:
+            miss = raw["prompt_cache_miss_tokens"]
+            hit = raw.get("prompt_cache_hit_tokens")
+            if type(miss) is not int or type(hit) is not int or miss < 0 or hit + miss != prompt_tokens:
+                raise ActualUsageUnavailable()
+    for usage, details_key, value_key in sources:
+        details = usage.get(details_key)
+        if details is None:
+            continue
+        if not isinstance(details, dict):
+            raise ActualUsageUnavailable()
+        if value_key in details:
+            candidates.append(details[value_key])
+    if not candidates:
+        return None
+    if any(type(value) is not int or value < 0 or value > prompt_tokens for value in candidates):
+        raise ActualUsageUnavailable()
+    if any(value != candidates[0] for value in candidates):
+        raise ActualUsageUnavailable()
+    return candidates[0]
+
+
 class RequestActualUsage:
     """每次请求新建；登记实际调用、完成校验，再冻结总量，不能挂到缓存模型上。
 
@@ -103,6 +138,7 @@ class RequestActualUsage:
                 self._reject()
             try:
                 tokens = actual_token_usage(message)
+                cached_tokens = actual_cached_tokens(message, tokens[0])
             except ActualUsageUnavailable:
                 self._reject()
             # 同一上游响应不能当作两个实际调用计费。无响应 ID 时仍执行调用票据的单次完成校验。
@@ -116,6 +152,7 @@ class RequestActualUsage:
             if prompt + completion > MAX_TOKENS:
                 self._reject()
             call["tokens"] = tokens
+            call["cached_tokens"] = cached_tokens
             return tokens
 
     def fail(self, call_id):
@@ -137,12 +174,31 @@ class RequestActualUsage:
             if self._failed or not self._calls or any(c["tokens"] is None for c in self._calls.values()):
                 self._reject()
             self._sealed = True
-            return (sum(c["tokens"][0] for c in self._calls.values()),
-                    sum(c["tokens"][1] for c in self._calls.values()))
+            return (
+                sum(c["tokens"][0] for c in self._calls.values()),
+                sum(c["tokens"][1] for c in self._calls.values()),
+            )
+
+    def cached_tokens(self):
+        with self._lock:
+            self.finalize()
+            values = [c["cached_tokens"] for c in self._calls.values()]
+            return None if any(v is None for v in values) else sum(values)
 
     def details(self):
         with self._lock:
             self.finalize()
-            return [{"call_id": c["call_id"], "purpose": c["purpose"],
-                     "prompt_tokens": c["tokens"][0], "completion_tokens": c["tokens"][1]}
-                    for c in self._calls.values()]
+            return [
+                {
+                    "call_id": c["call_id"],
+                    "purpose": c["purpose"],
+                    "prompt_tokens": c["tokens"][0],
+                    "completion_tokens": c["tokens"][1],
+                    **(
+                        {"cached_tokens": c["cached_tokens"], "cache_usage_source": "upstream"}
+                        if c["cached_tokens"] is not None
+                        else {}
+                    ),
+                }
+                for c in self._calls.values()
+            ]

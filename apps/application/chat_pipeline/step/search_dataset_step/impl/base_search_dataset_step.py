@@ -26,6 +26,8 @@ from knowledge.models import SearchMode
 from maxkb.conf import PROJECT_DIR
 from models_provider.models import Model
 from models_provider.tools import get_model, get_model_by_id, get_model_default_params
+from models_provider.impl.local_model_provider.model.embedding.web import LocalEmbedding
+from maxkb.const import CONFIG
 
 
 def reset_meta(meta):
@@ -59,18 +61,30 @@ class BaseSearchDatasetStep(ISearchDatasetStep):
                                                                  knowledge_id_list)
         if len(knowledge_id_list) == 0:
             return []
-        if manage.actual_usage is not None:
-            # embed_query 只返回向量，无本次实际用量；不能静默把检索算作零用量。
-            raise ActualUsageUnavailable()
         exec_problem_text = padding_problem_text if padding_problem_text is not None else problem_text
         model_id = get_embedding_id(knowledge_id_list)
         model = get_model_by_id(model_id, workspace_id)
         if model.model_type != "EMBEDDING":
             raise Exception(_("Model does not exist"))
         self.context['model_name'] = model.name
+        if manage.actual_usage is not None:
+            # 在构建模型前拒绝未知消费者，避免其初始化时发起远程调用。
+            if (model.provider != 'model_local_provider'
+                    or CONFIG.get('LOCAL_MODEL_HOST') not in {'localhost', '127.0.0.1', '::1'}
+                    or CONFIG.get('LOCAL_MODEL_PROTOCOL') != 'http'):
+                raise ActualUsageUnavailable()
         default_params = get_model_default_params(model)
         embedding_model = ModelManage.get_model(model_id, lambda _id: get_model(model, **{**default_params}))
+        if manage.actual_usage is not None and not isinstance(embedding_model, LocalEmbedding):
+            raise ActualUsageUnavailable()
         embedding_value = embedding_model.embed_query(exec_problem_text)
+        if manage.actual_usage is not None:
+            self.context['retrieval_usage'] = {
+                'source': 'local_embedding', 'provider': model.provider,
+                'model_id': str(model_id), 'operation': 'embed_query',
+                'vector_dimensions': len(embedding_value), 'token_usage': 'not_applicable',
+            }
+            manage.context['retrieval_usage'] = self.context['retrieval_usage']
         vector = VectorStore.get_embedding_vector()
         embedding_list = vector.query(exec_problem_text, embedding_value, knowledge_id_list, None,
                                       exclude_document_id_list,
@@ -148,6 +162,7 @@ class BaseSearchDatasetStep(ISearchDatasetStep):
             'problem_text': step_args.get(
                 'padding_problem_text') if 'padding_problem_text' in step_args else step_args.get('problem_text'),
             'model_name': self.context.get('model_name'),
+            **({'retrieval_usage': self.context['retrieval_usage']} if 'retrieval_usage' in self.context else {}),
             'message_tokens': 0,
             'answer_tokens': 0,
             'cost': 0
